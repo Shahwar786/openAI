@@ -8,6 +8,8 @@ use Intervention\Image\Facades\Image;
 use OpenAI;
 use Illuminate\Support\Str;
 use Log;
+use Smalot\PdfParser\Parser;
+use thiagoalessio\TesseractOCR\TesseractOCR;
 
 class ChatController extends Controller
 {
@@ -44,34 +46,80 @@ class ChatController extends Controller
     }
 
     public function sendMessage(Request $request)
-    {
-        try {
-            $sessionId = $request->input('sessionId');
-            $message = $request->input('message');
-            $personality = $request->input('personality', 'formal');
+{
+    $request->validate([
+        'sessionId' => 'required|string',
+        'file' => 'nullable|file|max:10240', // 10MB max size
+        'message' => 'nullable|string',
+    ]);
 
-            ChatHistory::create(['session_id' => $sessionId, 'message' => $message, 'is_user' => true]);
-
-            $client = OpenAI::client(env('OPENAI_API_KEY'));
-            $response = $client->chat()->create([
-                'model' => 'gpt-4',
-                'messages' => [
-                    ['role' => 'system', 'content' => "You are a {$personality} assistant."],
-                    ['role' => 'user', 'content' => $message]
-                ],
-                'max_tokens' => 150,
-            ]);
-
-            $botResponse = $response->choices[0]->message->content ?? 'No response';
-            ChatHistory::create(['session_id' => $sessionId, 'message' => $botResponse, 'is_user' => false]);
-
-            return response()->json(['response' => $botResponse]);
-
-        } catch (\Exception $e) {
-            \Log::error("Error in sendMessage: " . $e->getMessage());
-            return response()->json(['error' => 'An error occurred on the server.'], 500);
-        }
+    if (!$request->has('message') && !$request->hasFile('file')) {
+        return response()->json(['error' => 'Message or file is required.'], 400);
     }
+
+    
+    
+    try {
+        $sessionId = $request->input('sessionId');
+        $message = $request->input('message');
+        $personality = $request->input('personality', 'formal');
+        $hasFile = $request->hasFile('file');
+
+        Log::info("Session ID: " . ($sessionId ?? 'null'));
+        Log::info("Message: " . ($message ?? 'null'));
+        Log::info("Personality: " . $personality);
+        Log::info("File Present: " . ($hasFile ? 'Yes' : 'No'));
+
+        if (empty($message) && !$hasFile) {
+            Log::error("Error: No message or file uploaded");
+            return response()->json(['error' => 'Message or file is required.'], 400);
+        }
+
+        if (!empty($message)) {
+            ChatHistory::create(['session_id' => $sessionId, 'message' => $message, 'is_user' => true]);
+        }
+
+        if ($hasFile) {
+            $file = $request->file('file');
+            $tempPath = storage_path('app/temp/' . uniqid() . '.' . $file->getClientOriginalExtension());
+            $file->move(dirname($tempPath), basename($tempPath));
+
+            $fileContent = $this->analyzeFileContent($tempPath);
+            Log::info("Processed file content: " . $fileContent);
+            unlink($tempPath);
+
+            ChatHistory::create(['session_id' => $sessionId, 'message' => $fileContent, 'is_user' => true]);
+        }
+
+        $chatHistory = ChatHistory::where('session_id', $sessionId)->orderBy('created_at', 'asc')->get();
+
+        $messages = [
+            ['role' => 'system', 'content' => "You are a {$personality} assistant."],
+        ];
+
+        foreach ($chatHistory as $entry) {
+            $role = $entry->is_user ? 'user' : 'assistant';
+            $messages[] = ['role' => $role, 'content' => $entry->message];
+        }
+
+        $client = OpenAI::client(env('OPENAI_API_KEY'));
+        $response = $client->chat()->create([
+            'model' => 'gpt-4',
+            'messages' => $messages,
+            'max_tokens' => 150,
+        ]);
+
+        $botResponse = $response->choices[0]->message->content ?? 'No response';
+
+        ChatHistory::create(['session_id' => $sessionId, 'message' => $botResponse, 'is_user' => false]);
+        return response()->json(['response' => $botResponse]);
+
+    } catch (\Exception $e) {
+        Log::error("Error in sendMessage: " . $e->getMessage());
+        return response()->json(['error' => 'An error occurred on the server.'], 500);
+    }
+}
+
 
 
     public function newChat()
@@ -83,11 +131,32 @@ class ChatController extends Controller
 
     private function analyzeFileContent($filePath)
     {
-        $textContent = $this->extractMultilingualText($filePath);
-        if (!empty($textContent) && $textContent !== "No readable text detected in the image.") {
-            return $this->generateTextExplanation($textContent);
+        // Check the file extension to handle PDF or Image
+        $extension = pathinfo($filePath, PATHINFO_EXTENSION);
+        
+        if ($extension === 'pdf') {
+            return $this->extractTextFromPdf($filePath);
+        } else {
+            $textContent = $this->extractMultilingualText($filePath);
+            if (!empty($textContent) && $textContent !== "No readable text detected in the image.") {
+                return $this->generateTextExplanation($textContent);
+            }
+            return $this->generateImageExplanation();
         }
-        return $this->generateImageExplanation();
+    }
+
+    private function extractTextFromPdf($filePath)
+    {
+        try {
+            $parser = new Parser();
+            $pdf = $parser->parseFile($filePath);
+            $text = $pdf->getText();
+
+            return !empty($text) ? $text : "No readable text detected in the PDF.";
+        } catch (\Exception $e) {
+            Log::error("Error parsing PDF: " . $e->getMessage());
+            return "Error extracting text from the PDF.";
+        }
     }
 
     private function extractMultilingualText($filePath)
